@@ -44,7 +44,7 @@ impl StateMachine<'_> {
             | HunkMinus(Combined(merge_parents, InMergeConflict::No), _)
             | HunkZero(Combined(merge_parents, InMergeConflict::No), _)
             | HunkPlus(Combined(merge_parents, InMergeConflict::No), _) => {
-                handled_line = self.enter_merge_conflict(&merge_parents)
+                handled_line = self.enter_merge_conflict(&merge_parents)?
             }
             MergeConflict(merge_parents, Ours) => {
                 handled_line = self.enter_ancestral(&merge_parents)
@@ -76,14 +76,21 @@ impl StateMachine<'_> {
         Ok(handled_line)
     }
 
-    fn enter_merge_conflict(&mut self, merge_parents: &MergeParents) -> bool {
+    fn enter_merge_conflict(&mut self, merge_parents: &MergeParents) -> std::io::Result<bool> {
         use State::*;
         if let Some(commit) = parse_merge_marker(&self.line, "++<<<<<<<") {
+            let commit = commit.to_string();
+            // If the conflict is the first thing in the hunk, the hunk header has not been
+            // emitted yet (that normally happens in handle_hunk_line). Emit it now so that the
+            // line numbers are initialized from the header.
+            if let HunkHeader(_, parsed_hunk_header, line, raw_line) = &self.state.clone() {
+                self.emit_hunk_header_line(parsed_hunk_header, line, raw_line)?;
+            }
             self.state = MergeConflict(merge_parents.clone(), Ours);
-            self.painter.merge_conflict_commit_names[Ours] = Some(commit.to_string());
-            true
+            self.painter.merge_conflict_commit_names[Ours] = Some(commit);
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -142,6 +149,13 @@ impl StateMachine<'_> {
             &mut self.painter,
             self.config,
         )?;
+        // Both derived diffs (ancestor -> ours, ancestor -> theirs) describe the same region of
+        // the file, so they must both start from the same line numbers.
+        let line_numbers = self
+            .painter
+            .line_numbers_data
+            .as_ref()
+            .map(|data| data.line_number.clone());
         for (derived_commit_type, header_style) in &[
             (Ours, self.config.merge_conflict_ours_diff_header_style),
             (Theirs, self.config.merge_conflict_theirs_diff_header_style),
@@ -153,6 +167,11 @@ impl StateMachine<'_> {
                 self.config,
             )?;
             self.painter.emit()?;
+            if let (Some(data), Some(line_numbers)) =
+                (self.painter.line_numbers_data.as_mut(), &line_numbers)
+            {
+                data.line_number = line_numbers.clone();
+            }
             paint::paint_minus_and_plus_lines(
                 MinusPlus::new(
                     &self.painter.merge_conflict_lines[Ancestral],
@@ -353,6 +372,70 @@ ancestor ⟶   HEAD │
         ));
         assert!(output.contains("\n▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲"));
     }
+
+    #[test]
+    fn test_merge_conflict_line_numbers_no_context() {
+        let config = integration_test_utils::make_config_from_args(&["--line-numbers"]);
+        let output = integration_test_utils::run_delta(GIT_TOY_MERGE_CONFLICT_NO_CONTEXT, &config);
+        let output = strip_ansi_codes(&output);
+        // Both derived diffs start at the line number given in the hunk header.
+        assert!(output.contains(
+            "\
+ancestor ⟶   HEAD │
+──────────────────┘
+    ⋮  1 │a
+"
+        ));
+        assert!(output.contains(
+            "\
+ancestor ⟶   0c20c9d... wip │
+────────────────────────────┘
+    ⋮  1 │b
+"
+        ));
+    }
+
+    #[test]
+    fn test_merge_conflict_line_numbers_with_context() {
+        let config = integration_test_utils::make_config_from_args(&["--line-numbers"]);
+        let output =
+            integration_test_utils::run_delta(GIT_TOY_MERGE_CONFLICT_WITH_CONTEXT, &config);
+        let output = strip_ansi_codes(&output);
+        assert!(output.contains("\n 50 ⋮ 50 │"));
+        // The second derived diff must not continue counting from where the first one stopped.
+        assert!(output.contains(
+            "\
+ancestor ⟶   HEAD │
+──────────────────┘
+ 51 ⋮    │base
+    ⋮ 51 │a
+"
+        ));
+        assert!(output.contains(
+            "\
+ancestor ⟶   0c20c9d... wip │
+────────────────────────────┘
+ 51 ⋮    │base
+    ⋮ 51 │b
+"
+        ));
+    }
+
+    const GIT_TOY_MERGE_CONFLICT_WITH_CONTEXT: &str = "\
+diff --cc file
+index 6178079,7898192..0000000
+--- a/file
++++ b/file
+@@@ -50,2 -50,2 +50,7 @@@
+  context
+++<<<<<<< HEAD
+ +a
+++||||||| parent of 0c20c9d... wip
+++base
+++=======
++ b
+++>>>>>>> 0c20c9d... wip
+";
 
     const GIT_TOY_MERGE_CONFLICT_NO_CONTEXT: &str = "\
 diff --cc file
